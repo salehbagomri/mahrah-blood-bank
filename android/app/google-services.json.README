@@ -1,0 +1,15 @@
+# ملاحظة مهمة: ملف google-services.json
+
+هذا ملف placeholder. يجب عليك:
+
+1. الذهاب إلى Firebase Console: https://console.firebase.google.com
+2. اختيار مشروعك
+3. إضافة تطبيق Android
+4. تحميل ملف google-services.json الحقيقي
+5. استبدال هذا الملف به
+
+معلومات التطبيق:
+- Package name: com.mahrah.bloodbank.mahrah_blood_bank
+- App nickname: بنك الدم - المهرة
+
+بدون هذا الملف الحقيقي، لن تعمل خدمات Firebase.

@@ -1,0 +1,421 @@
+﻿import 'dart:async';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:provider/provider.dart';
+import 'package:mahrah_blood_bank/config/theme.dart';
+import 'package:mahrah_blood_bank/providers/auth_provider.dart';
+import 'package:mahrah_blood_bank/services/supabase_service.dart';
+import 'package:mahrah_blood_bank/utils/constants.dart';
+import 'package:mahrah_blood_bank/widgets/custom_button.dart';
+
+/// شاشة التحقق من رمز OTP
+class OTPVerificationScreen extends StatefulWidget {
+  final String phoneNumber;
+  final String userType;
+
+  const OTPVerificationScreen({
+    super.key,
+    required this.phoneNumber,
+    required this.userType,
+  });
+
+  @override
+  State<OTPVerificationScreen> createState() => _OTPVerificationScreenState();
+}
+
+class _OTPVerificationScreenState extends State<OTPVerificationScreen> {
+  final List<TextEditingController> _otpControllers = List.generate(
+    6,
+    (index) => TextEditingController(),
+  );
+
+  final List<FocusNode> _focusNodes = List.generate(
+    6,
+    (index) => FocusNode(),
+  );
+
+  bool _isLoading = false;
+  bool _canResend = false;
+  int _resendTimer = 60;
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    _startResendTimer();
+
+    // إضافة listeners للـ FocusNodes لتحديث الألوان
+    for (var focusNode in _focusNodes) {
+      focusNode.addListener(() {
+        setState(() {});
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    for (var controller in _otpControllers) {
+      controller.dispose();
+    }
+    for (var focusNode in _focusNodes) {
+      focusNode.dispose();
+    }
+    super.dispose();
+  }
+
+  void _startResendTimer() {
+    _canResend = false;
+    _resendTimer = 60;
+    _timer?.cancel();
+
+    _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (mounted) {
+        setState(() {
+          if (_resendTimer > 0) {
+            _resendTimer--;
+          } else {
+            _canResend = true;
+            timer.cancel();
+          }
+        });
+      }
+    });
+  }
+
+  Future<void> _verifyOTP() async {
+    final otpCode = _otpControllers.map((c) => c.text).join();
+
+    if (otpCode.length != 6) {
+      _showError('الرجاء إدخال رمز التحقق كاملاً');
+      return;
+    }
+
+    setState(() => _isLoading = true);
+
+    try {
+      final authProvider = Provider.of<AuthProvider>(context, listen: false);
+
+      print('🔐 التحقق من OTP: $otpCode');
+
+      final isNewUser = await authProvider.verifyOTP(
+        widget.phoneNumber,
+        otpCode,
+      );
+
+      if (!mounted) return;
+
+      print('✅ التحقق نجح! مستخدم جديد: $isNewUser');
+
+      if (isNewUser) {
+        print('📝 إنشاء مستخدم جديد في Supabase...');
+
+        try {
+          final newUser = await SupabaseService.createUser(
+            phone: '+967${widget.phoneNumber}',
+            userType: widget.userType,
+          );
+
+          if (newUser == null) {
+            throw Exception('فشل إنشاء المستخدم في قاعدة البيانات');
+          }
+
+          print('✅ تم إنشاء/جلب المستخدم: ${newUser.id}');
+
+          authProvider.updateCurrentUser(newUser);
+
+          final isRegistrationComplete =
+              await _checkRegistrationComplete(newUser);
+
+          if (isRegistrationComplete) {
+            print('✅ المستخدم مسجل بالكامل، الانتقال للصفحة الرئيسية');
+            Navigator.of(context).pushNamedAndRemoveUntil(
+              '/home',
+              (route) => false,
+            );
+            return;
+          }
+        } catch (e) {
+          print('❌ خطأ في إنشاء المستخدم: $e');
+          if (mounted) {
+            _showError('حدث خطأ أثناء إنشاء الحساب');
+            setState(() => _isLoading = false);
+          }
+          return;
+        }
+
+        if (!mounted) return;
+
+        // مستخدم جديد - الانتقال لإكمال التسجيل
+        print('📝 الانتقال لإكمال التسجيل');
+
+        // استخدام نوع المستخدم من قاعدة البيانات (وليس من widget)
+        final actualUserType =
+            authProvider.currentUser?.userType ?? widget.userType;
+
+        if (actualUserType == 'donor') {
+          Navigator.of(context).pushReplacementNamed(
+            '/donor-registration',
+            arguments: widget.phoneNumber,
+          );
+        } else if (actualUserType == 'hospital') {
+          Navigator.of(context).pushReplacementNamed(
+            '/hospital-registration',
+            arguments: widget.phoneNumber,
+          );
+        } else {
+          // patient - الانتقال مباشرة لطلب الدم
+          Navigator.of(context).pushReplacementNamed(
+            '/create-blood-request',
+            arguments: {'requesterType': 'patient'},
+          );
+        }
+      } else {
+        // مستخدم موجود - الانتقال للصفحة الرئيسية
+        Navigator.of(context).pushNamedAndRemoveUntil(
+          '/home',
+          (route) => false,
+        );
+      }
+    } catch (e) {
+      print('❌ خطأ في التحقق من OTP: $e');
+      if (mounted) {
+        _showError('رمز التحقق غير صحيح');
+        _clearOTP();
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isLoading = false);
+      }
+    }
+  }
+
+  Future<bool> _checkRegistrationComplete(dynamic user) async {
+    try {
+      if (user.userType == 'donor') {
+        final donor = await SupabaseService.getDonorByUserId(user.id);
+        return donor != null;
+      } else if (user.userType == 'hospital') {
+        final supabaseService = SupabaseService();
+        final hospital = await supabaseService.getHospitalByUserId(user.id);
+        return hospital != null;
+      } else if (user.userType == 'patient') {
+        final patient = await SupabaseService.getPatientByUserId(user.id);
+        return patient != null;
+      }
+      return false;
+    } catch (e) {
+      print('❌ خطأ في التحقق من اكتمال التسجيل: $e');
+      return false;
+    }
+  }
+
+  Future<void> _resendOTP() async {
+    setState(() => _isLoading = true);
+
+    try {
+      final authProvider = Provider.of<AuthProvider>(context, listen: false);
+      final success = await authProvider.sendOTP(widget.phoneNumber);
+
+      if (mounted) {
+        if (success) {
+          _showSuccess('تم إرسال رمز التحقق مرة أخرى');
+          _startResendTimer();
+          _clearOTP();
+        } else {
+          _showError('فشل إرسال رمز التحقق');
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        _showError('حدث خطأ أثناء إرسال الرمز');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isLoading = false);
+      }
+    }
+  }
+
+  void _clearOTP() {
+    for (var controller in _otpControllers) {
+      controller.clear();
+    }
+    _focusNodes[0].requestFocus();
+  }
+
+  void _showError(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: AppTheme.errorColor,
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
+  void _showSuccess(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: AppTheme.successColor,
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('التحقق من الهاتف'),
+        centerTitle: true,
+      ),
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(AppConstants.defaultPadding),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const SizedBox(height: 32),
+
+              // الأيقونة
+              const Icon(
+                Icons.phone_android,
+                size: 80,
+                color: AppTheme.primaryRed,
+              ),
+
+              const SizedBox(height: 24),
+
+              // العنوان
+              Text(
+                'أدخل رمز التحقق',
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.headlineMedium?.copyWith(
+                      fontWeight: FontWeight.bold,
+                    ),
+              ),
+
+              const SizedBox(height: 12),
+
+              // النص التوضيحي
+              Text(
+                'تم إرسال رمز مكون من 6 أرقام إلى\n${widget.phoneNumber}',
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  fontSize: 16,
+                  color: AppTheme.textSecondary,
+                  height: 1.5,
+                ),
+              ),
+
+              const SizedBox(height: 40),
+
+              // مربعات OTP
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                children: List.generate(6, (index) => _buildOTPField(index)),
+              ),
+
+              const SizedBox(height: 32),
+
+              // زر التحقق
+              CustomButton(
+                text: 'تحقق',
+                onPressed: _isLoading ? null : _verifyOTP,
+                isLoading: _isLoading,
+              ),
+
+              const SizedBox(height: 24),
+
+              // زر إعادة الإرسال
+              TextButton(
+                onPressed: _canResend && !_isLoading ? _resendOTP : null,
+                child: Text(
+                  _canResend
+                      ? 'إعادة إرسال الرمز'
+                      : 'إعادة الإرسال بعد $_resendTimer ثانية',
+                  style: TextStyle(
+                    fontSize: 16,
+                    color: _canResend
+                        ? AppTheme.primaryRed
+                        : AppTheme.textSecondary,
+                  ),
+                ),
+              ),
+
+              const Spacer(),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// بناء حقل OTP واحد مع جميع التحسينات
+  Widget _buildOTPField(int index) {
+    return Container(
+      width: 50,
+      height: 60,
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: _focusNodes[index].hasFocus
+              ? AppTheme.primaryRed
+              : _otpControllers[index].text.isNotEmpty
+                  ? AppTheme.secondaryGreen
+                  : AppTheme.dividerColor,
+          width: 2,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: _focusNodes[index].hasFocus
+                ? AppTheme.primaryRed.withOpacity(0.2)
+                : Colors.black.withOpacity(0.05),
+            blurRadius: 10,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      child: TextField(
+        controller: _otpControllers[index],
+        focusNode: _focusNodes[index],
+        keyboardType: TextInputType.number,
+        textAlign: TextAlign.center,
+        textDirection: TextDirection.ltr,
+        autofocus: index == 0,
+        style: const TextStyle(
+          fontSize: 20,
+          fontWeight: FontWeight.bold,
+          color: AppTheme.textPrimary,
+        ),
+        inputFormatters: [
+          FilteringTextInputFormatter.digitsOnly,
+        ],
+        decoration: const InputDecoration(
+          counterText: '',
+          border: InputBorder.none,
+          contentPadding: EdgeInsets.zero,
+        ),
+        maxLength: 1,
+        onChanged: (value) {
+          if (value.isNotEmpty) {
+            if (index < 5) {
+              _focusNodes[index + 1].requestFocus();
+            } else {
+              _focusNodes[index].unfocus();
+              _verifyOTP();
+            }
+          } else {
+            if (index > 0) {
+              _focusNodes[index - 1].requestFocus();
+            }
+          }
+          setState(() {});
+        },
+      ),
+    );
+  }
+}
